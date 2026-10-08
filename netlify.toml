@@ -1,0 +1,76 @@
+#  Mini Emergency & Critical Care Event EMR — Netlify configuration
+#
+#  Environment variables to set in Site configuration → Environment variables
+#  (see docs/DEPLOY.md):
+#    GOOGLE_SERVICE_ACCOUNT_JSON  the whole service-account key file
+#    GDRIVE_FOLDER_ID             the folder you shared with that service account
+#    GDRIVE_SHARED_DRIVE_ID       optional, only for a Shared Drive
+#
+#  There is no npm install: the app is plain JavaScript and the build is a
+#  single Python script, so a deploy takes a couple of seconds.
+
+[build]
+  # dist/ is committed, so there is genuinely nothing the server has to build.
+  # The build is still attempted so a push of changed src/ refreshes dist/, but
+  # it can never fail the deploy: if python3 is missing or the script errors,
+  # the committed dist/ is published as-is. A deploy that publishes nothing is
+  # far worse than one that publishes a slightly stale bundle.
+  command  = "python3 build/build_dist.py || echo 'Build skipped - publishing the committed dist/'"
+  publish  = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/api/*"
+  to   = "/.netlify/functions/:splat"
+  status = 200
+  force  = true
+
+# Single-page app: every unknown path falls back to the shell so a post can
+# bookmark #/patient/<id> and refresh it.
+[[redirects]]
+  from = "/*"
+  to   = "/index.html"
+  status = 200
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "geolocation=(), microphone=(), camera=()"
+    # Google Fonts is the only third party the app touches. frame-ancestors
+    # 'self' rather than X-Frame-Options DENY, because the EMR is designed to
+    # be embeddable in the hospital's own registration app.
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; form-action 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'"
+
+# The service worker must never be served stale, or a redeploy never reaches
+# the field.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+# app.js and the reference are rebuilt under the same names, so they are
+# revalidated rather than cached forever.
+[[headers]]
+  for = "/app.js"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/data/*"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"

@@ -1,0 +1,13 @@
+{
+  "name": "Mini Emergency & Critical Care Event EMR",
+  "short_name": "Mini EC Event EMR",
+  "description": "Offline-first mini-EMR for hospital medical standby at mass-gathering events.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#eef1f6",
+  "theme_color": "#1c2e7a",
+  "icons": [
+    { "src": "assets/siloam.png", "sizes": "480x194", "type": "image/png", "purpose": "any" }
+  ]
+}
