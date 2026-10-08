@@ -24,6 +24,37 @@
     return !EV.model.isBound();
   };
 
+  /* Sync is keyed by eventId, so a device that has never joined one can only
+     ever see events already in its own store — which on a fresh tablet is none.
+     That is why a second post used to find nothing here and fall through to
+     creating a duplicate event. Ask the server for the index, merge it in, and
+     the local-first render below then has something real to list. Best effort:
+     offline, or a server that cannot answer, renders exactly what it did before. */
+  var discoveredAt = 0;
+  var discovering = null;
+
+  function discoverEvents() {
+    /* Hand back the in-flight call rather than a stale 0. Admin login asks for
+       this the instant the screen opens, while the render's own call is still
+       on the wire — answering 0 there is what would create the duplicate. */
+    if (discovering) return discovering;
+    var cfg = EV.settings.sync;
+    if (!cfg || !cfg.enabled || !cfg.endpoint) return Promise.resolve(0);
+    if (!EV.online()) return Promise.resolve(0);
+    /* Doubles as the loop guard: the re-render below re-enters this route. */
+    if (EV.now() - discoveredAt < 8000) return Promise.resolve(0);
+    discoveredAt = EV.now();
+    discovering = EV.store.fetchJson(cfg.endpoint, { action: 'events' }).then(function (res) {
+      if (!res || res.ok === false) return 0;
+      var list = res.events || [];
+      return list.length ? EV.store.bulk(list) : 0;
+    })['catch'](function () { return 0; }).then(function (n) {
+      discovering = null;
+      return n;
+    });
+    return discovering;
+  }
+
   UI.route('landing', function (root) {
     var wrap = EV.el('div', { class: 'landing' });
     root.appendChild(wrap);
@@ -73,6 +104,10 @@
       });
       wrap.appendChild(cl);
     }
+
+    discoverEvents().then(function (found) {
+      if (found > 0 && wrap.isConnected) UI.go('landing');
+    });
   });
 
   function hero() {
@@ -431,22 +466,27 @@
   function adminLogin() {
     UI.requireUnlock('Admin access to this device.').then(function (ok) {
       if (!ok) return;
-      var events = EV.model.activeEvents();
-      if (!events.length) { createEvent(); return; }
-      if (events.length === 1) { adminInto(events[0]); return; }
-      var sh = UI.sheet({ title: 'Admin — choose an event', footer: [] });
-      var body = EV.el('div', { class: 'stack tight' });
-      events.forEach(function (ev) {
-        var b = EV.el('button', { class: 'prow', type: 'button' }, [
-          EV.el('span', { class: 'grow' }, [
-            EV.el('span', { class: 'nm', text: ev.name }),
-            EV.el('span', { class: 'sub', text: EV.dmyhm(EV.model.eventStart(ev)) })
-          ])
-        ]);
-        b.addEventListener('click', function () { sh.close(); adminInto(ev); });
-        body.appendChild(b);
+      /* Wait for the server's event index before concluding there is nothing to
+         join — otherwise a post that opens the app and signs straight in makes a
+         second event alongside the one it should have joined. */
+      return discoverEvents().then(function () {
+        var events = EV.model.activeEvents();
+        if (!events.length) { createEvent(); return; }
+        if (events.length === 1) { adminInto(events[0]); return; }
+        var sh = UI.sheet({ title: 'Admin — choose an event', footer: [] });
+        var body = EV.el('div', { class: 'stack tight' });
+        events.forEach(function (ev) {
+          var b = EV.el('button', { class: 'prow', type: 'button' }, [
+            EV.el('span', { class: 'grow' }, [
+              EV.el('span', { class: 'nm', text: ev.name }),
+              EV.el('span', { class: 'sub', text: EV.dmyhm(EV.model.eventStart(ev)) })
+            ])
+          ]);
+          b.addEventListener('click', function () { sh.close(); adminInto(ev); });
+          body.appendChild(b);
+        });
+        sh.setBody(body);
       });
-      sh.setBody(body);
     });
   }
 
