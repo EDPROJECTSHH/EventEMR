@@ -13,10 +13,38 @@
  *   GDRIVE_FOLDER_ID             required. Default parent folder id.
  *   GDRIVE_SHARED_DRIVE_ID       optional. Set when the folder lives on a Shared
  *                                Drive, so searches look in the right corpus.
+ *   GOOGLE_IMPERSONATE_USER      optional. A Workspace user's email. When set,
+ *                                the signed JWT carries a `sub` claim and the
+ *                                service account acts AS that user (domain-wide
+ *                                delegation), so files are owned by them.
  *   DRIVE_ALLOWED_ORIGINS        optional, comma-separated extra origins.
  *
+ *   --- the personal-account path (no Google Workspace needed) ---
+ *   GOOGLE_OAUTH_CLIENT_ID       \
+ *   GOOGLE_OAUTH_CLIENT_SECRET    >  set all three to upload as a human instead
+ *   GOOGLE_OAUTH_REFRESH_TOKEN   /   of as the service account. Takes priority
+ *                                over the service account when present.
+ *
+ * A service account owns no storage. Writing into a folder that lives in a
+ * human's My Drive therefore fails with 403 storageQuotaExceeded, and sharing
+ * that folder with the service account does not help — the new file would still
+ * be owned by an account with zero quota. The only two ways out, both supported
+ * here, are a Shared Drive (the drive owns the file) or GOOGLE_IMPERSONATE_USER
+ * (the impersonated user owns it).
+ *
+ * BOTH of those require Google Workspace: Shared Drives do not exist on a
+ * personal @gmail.com account, and domain-wide delegation needs an Admin
+ * console. For a personal account the only way to write into My Drive is to act
+ * as the human, which is what the GOOGLE_OAUTH_* refresh-token path does — the
+ * file is owned by them and uses their 15 GB. See:
+ *   https://developers.google.com/workspace/drive/api/guides/about-shareddrives
+ *   https://developers.google.com/identity/protocols/oauth2/service-account
+ *
  * Actions, all POST { action, ... }:
- *   ping   -> { ok, folder, folderId, account, sharedDrive }
+ *   ping   -> { ok, folder, folderId, account, sharedDrive, mode,
+ *               impersonating, message }   mode: sharedDrive | impersonation |
+ *               serviceAccount. ok is false when the configuration cannot
+ *               actually upload, rather than green-lighting a first failure.
  *   folder -> { ok, id, name, created }      find-or-create, idempotent
  *   upload -> { ok, id, name, webViewLink, modifiedTime, updated }
  *   list   -> { ok, files, nextPageToken, folderId }
@@ -36,7 +64,20 @@ const MAX_B64 = 12 * 1024 * 1024;
 const MAX_BODY_BYTES = 20 * 1024 * 1024;
 const MAX_NAME = 200;
 const DRIVE_ID_RE = /^[A-Za-z0-9_-]{6,256}$/;
+const EMAIL_RE = /^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/;
 const FILE_FIELDS = 'id,name,mimeType,size,modifiedTime,webViewLink,webContentLink,parents';
+
+/* Google's own text here is "Service Accounts do not have storage quota.
+   Leverage shared drives …, or use OAuth delegation … instead", which hands a
+   medic two documentation links mid-event. Name both remedies in the terms of
+   this site's own env vars instead. Kept short enough to survive niceError()'s
+   400-character clamp once a prefix is added. */
+const QUOTA_FIX =
+  'a service account has no Drive storage, so it cannot own files in a My Drive ' +
+  'folder — sharing the folder with it is not enough. Either (1) move the folder ' +
+  'into a Shared Drive, add the service account as Content manager and set ' +
+  'GDRIVE_SHARED_DRIVE_ID, or (2) set GOOGLE_IMPERSONATE_USER to a Workspace ' +
+  'user with domain-wide delegation.';
 
 /* ---------------------------------------------------------------- helpers -- */
 
@@ -137,19 +178,121 @@ function sharedDriveId() {
   return id && DRIVE_ID_RE.test(id) ? id : '';
 }
 
+/* The Workspace user to act as, or '' for none. A typo is thrown rather than
+   ignored: silently falling back to the plain service account would leave the
+   site in the exact broken state this variable was set to fix. */
+function impersonateUser() {
+  const raw = str(process.env.GOOGLE_IMPERSONATE_USER);
+  if (!raw) return '';
+  if (!EMAIL_RE.test(raw)) {
+    throw bad('GOOGLE_IMPERSONATE_USER is not an email address');
+  }
+  return raw;
+}
+
 /* Module-scope cache: a warm container reuses one token for the whole hour, so
-   a 200-record Drive push costs exactly one OAuth round trip. */
-let tokenCache = { token: '', exp: 0, account: '' };
+   a 200-record Drive push costs exactly one OAuth round trip. Keyed on the
+   identity as well as the clock — an impersonated token is not interchangeable
+   with a bare service-account one. */
+let tokenCache = { token: '', exp: 0, account: '', subject: '' };
+
+/* ---- the personal-account path ------------------------------------------
+   A service account cannot own a file in My Drive, and neither of the Workspace
+   remedies exists on a personal Google account. Acting as the human does: a
+   one-time consent yields a refresh token, and every upload from then on is
+   owned by them and billed to their own quota.
+
+   Verified against
+   https://developers.google.com/identity/protocols/oauth2/web-server#offline —
+   POST grant_type=refresh_token with the client id, secret and refresh token to
+   https://oauth2.googleapis.com/token. */
+function oauthCreds() {
+  const id = str(process.env.GOOGLE_OAUTH_CLIENT_ID);
+  const secret = str(process.env.GOOGLE_OAUTH_CLIENT_SECRET);
+  const refresh = str(process.env.GOOGLE_OAUTH_REFRESH_TOKEN);
+  if (!id && !secret && !refresh) return null;
+  if (!id || !secret || !refresh) {
+    throw bad('The GOOGLE_OAUTH_* path needs all three of GOOGLE_OAUTH_CLIENT_ID, ' +
+      'GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN');
+  }
+  return { id: id, secret: secret, refresh: refresh };
+}
+
+let oauthCache = { token: '', exp: 0, id: '' };
+
+async function oauthToken(force, oc) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!force && oauthCache.token && oauthCache.exp - 60 > nowSec && oauthCache.id === oc.id) {
+    return oauthCache.token;
+  }
+  const form = new URLSearchParams();
+  form.set('grant_type', 'refresh_token');
+  form.set('client_id', oc.id);
+  form.set('client_secret', oc.secret);
+  form.set('refresh_token', oc.refresh);
+
+  const r = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString()
+  });
+  const txt = await r.text();
+  let j = null;
+  try { j = JSON.parse(txt); } catch (e) { /* non-JSON error page */ }
+
+  if (!r.ok || !j || !j.access_token) {
+    const detail = (j && (j.error_description || j.error)) || ('HTTP ' + r.status);
+    if (/invalid_grant/i.test(String(detail))) {
+      throw bad('The Google refresh token is no longer valid — it was revoked, expired ' +
+        'while the OAuth app was in testing mode, or belongs to a different client. ' +
+        'Generate a new one and update GOOGLE_OAUTH_REFRESH_TOKEN.');
+    }
+    throw bad('Google rejected the OAuth refresh: ' + detail);
+  }
+  oauthCache = {
+    token: String(j.access_token),
+    exp: nowSec + (Number(j.expires_in) || 3600),
+    id: oc.id
+  };
+  return oauthCache.token;
+}
+
+/* Which identity is in play. Checked in one place so ping and every Drive call
+   agree about it. */
+function authMode() {
+  let oc = null;
+  try { oc = oauthCreds(); } catch (e) { return { kind: 'oauth-misconfigured', error: e }; }
+  if (oc) return { kind: 'oauth', oauth: oc };
+  if (impersonateUser()) return { kind: 'impersonation' };
+  return { kind: 'serviceAccount' };
+}
 
 async function accessToken(force) {
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (!force && tokenCache.token && tokenCache.exp - 60 > nowSec) return tokenCache.token;
+  /* The human-owned path wins when it is configured: it is the only one that
+     can write into a personal My Drive. */
+  const oc = oauthCreds();
+  if (oc) return oauthToken(force, oc);
 
+  const nowSec = Math.floor(Date.now() / 1000);
   const c = creds();
+  const sub = impersonateUser();
+  if (!force && tokenCache.token && tokenCache.exp - 60 > nowSec &&
+      tokenCache.account === c.email && tokenCache.subject === sub) {
+    return tokenCache.token;
+  }
+
   const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-  const claims = b64url(JSON.stringify({
+  const claimSet = {
     iss: c.email, scope: SCOPE, aud: c.tokenUri, iat: nowSec, exp: nowSec + 3600
-  }));
+  };
+  /* Domain-wide delegation. Verified against
+     https://developers.google.com/identity/protocols/oauth2/service-account —
+     "sub: The email address of the user for which the application is requesting
+     delegated access". The scope above must be authorised for this service
+     account's client id in the Admin console byte for byte; the token endpoint
+     answers unauthorized_client when it is not, which is handled below. */
+  if (sub) claimSet.sub = sub;
+  const claims = b64url(JSON.stringify(claimSet));
   const signing = header + '.' + claims;
 
   let sig;
@@ -177,12 +320,18 @@ async function accessToken(force) {
   if (!r.ok || !j || !j.access_token) {
     const detail = j && (j.error_description || j.error) ? (j.error_description || j.error)
       : ('HTTP ' + r.status);
+    if (sub && /unauthorized_client/i.test(String((j && j.error) || '') + ' ' + String(detail))) {
+      throw bad('Google will not let this service account act as ' + sub +
+        ' — in the Admin console, add its client id under API controls > ' +
+        'domain-wide delegation with the scope ' + SCOPE);
+    }
     throw bad('Google rejected the service account: ' + detail);
   }
   tokenCache = {
     token: String(j.access_token),
     exp: nowSec + (Number(j.expires_in) || 3600),
-    account: c.email
+    account: c.email,
+    subject: sub
   };
   return tokenCache.token;
 }
@@ -200,10 +349,25 @@ async function callOnce(url, opts, token) {
   let j = null;
   try { j = JSON.parse(txt); } catch (e) { /* ignore */ }
   if (!r.ok) {
-    const msg = j && j.error && j.error.message ? j.error.message : ('HTTP ' + r.status);
+    const ge = j && j.error ? j.error : null;
+    const msg = ge && ge.message ? String(ge.message) : ('HTTP ' + r.status);
+    let reason = '';
+    if (ge && Array.isArray(ge.errors) && ge.errors.length && ge.errors[0] && ge.errors[0].reason) {
+      reason = String(ge.errors[0].reason);
+    }
     const err = new Error(msg);
     err.status = r.status;
     err.drive = true;
+    err.reason = reason;
+    /* 403 storageQuotaExceeded is the service-account-owns-nothing wall, and it
+       hits folder creation just as hard as upload — so translate it here, once,
+       for every write. The message sniff is the fallback for error payloads
+       that carry no errors[] array. Reason string verified against
+       https://developers.google.com/workspace/drive/api/guides/handle-errors */
+    if (reason === 'storageQuotaExceeded' || /storage quota/i.test(msg)) {
+      err.quota = true;
+      err.message = 'Google refused this write: ' + QUOTA_FIX;
+    }
     throw err;
   }
   return j || {};
@@ -237,7 +401,13 @@ async function drive(path, opts) {
   }
 }
 
-/* Search options that make a query see Shared Drive content too. */
+/* Search options that make a query see Shared Drive content too. These three
+   are files.list parameters only — verified against
+   https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list
+   ("corpora: user, domain, drive, allDrives"; "corpora='drive' … The driveId
+   must be specified in the request"). files.create has no driveId or corpora
+   parameter at all: a created file lands in a shared drive purely by having a
+   parent there, with supportsAllDrives=true, which drive() always sends. */
 function searchScope() {
   const sd = sharedDriveId();
   const out = { includeItemsFromAllDrives: 'true' };
@@ -257,23 +427,91 @@ function parentOf(body) {
 
 /* ---------------------------------------------------------------- actions -- */
 
+/* A green light that fails on the first upload is worse than an honest red one,
+   so ping answers the question that actually matters — can this configuration
+   own a file? — rather than merely whether the folder is readable. The folder
+   get runs under the impersonated identity when one is set, so what comes back
+   describes the identity that will do the writing. */
 async function actionPing() {
   const id = folderId();
+  const impersonating = impersonateUser();
   await accessToken(false);
   const f = await drive('/files/' + encodeURIComponent(id), {
-    query: { fields: 'id,name,mimeType,driveId,trashed' }
+    query: { fields: 'id,name,mimeType,driveId,trashed,capabilities(canAddChildren)' }
   });
   if (f.mimeType && f.mimeType !== FOLDER_MIME) {
     throw bad('GDRIVE_FOLDER_ID points at a file, not a folder');
   }
   if (f.trashed) throw bad('The Drive folder is in the trash');
-  return {
-    ok: true,
+
+  /* File.driveId is "Only populated for items in shared drives", so its absence
+     is the definitive test for "this folder is in somebody's My Drive". */
+  const actualDrive = str(f.driveId);
+  const configured = sharedDriveId();
+  const caps = f.capabilities || {};
+
+  let ok = true;
+  let mode = 'serviceAccount';
+  let message = '';
+  const am = authMode();
+  if (am.kind === 'oauth') {
+    /* Acting as the human: the file is theirs and uses their quota, so a My
+       Drive folder is perfectly fine and no shared drive is needed. */
+    mode = 'oauth';
+    message = 'Signed in as a Google user via a refresh token: new files are ' +
+      'owned by that account and use their Drive quota. This is the path that ' +
+      'works on a personal @gmail.com account.';
+  } else if (actualDrive) {
+    mode = 'sharedDrive';
+    message = 'Shared drive: new files are owned by the drive, not by the ' +
+      'service account, so no personal quota is involved.';
+  } else if (impersonating) {
+    mode = 'impersonation';
+    message = 'Domain-wide delegation: acting as ' + impersonating +
+      ', so new files are owned by that user and use their Drive quota.';
+  } else {
+    ok = false;
+    message = 'Plain service account with a My Drive folder — uploads WILL ' +
+      'fail with Google\'s storage-quota error: ' + QUOTA_FIX;
+  }
+
+  /* The shared-drive mismatch check below is about which corpus searches use.
+     It is meaningless when acting as a user, who simply sees their own Drive. */
+  const skipDriveChecks = (mode === 'oauth');
+
+  /* corpora=drive scopes every search to one drive. Aimed at the wrong one, the
+     find-or-create in actionFolder sees nothing and makes a fresh duplicate
+     folder on every single run, quietly, forever. */
+  if (!skipDriveChecks && configured && configured !== actualDrive) {
+    ok = false;
+    message = actualDrive
+      ? 'GDRIVE_SHARED_DRIVE_ID is ' + configured + ' but this folder lives in ' +
+        'drive ' + actualDrive + ', so searches look in the wrong drive and ' +
+        'subfolders get duplicated. Set it to ' + actualDrive + ', or clear it.'
+      : 'GDRIVE_SHARED_DRIVE_ID is set but this folder is not in a shared ' +
+        'drive, so searches look in a drive that does not contain it and ' +
+        'subfolders get duplicated. Clear it, or point GDRIVE_FOLDER_ID at a ' +
+        'folder inside that shared drive.';
+  } else if (!skipDriveChecks && caps.canAddChildren === false) {
+    ok = false;
+    message = 'The folder is readable but not writable by this account — share ' +
+      'it as Editor on My Drive, or Content manager on a shared drive.';
+  }
+
+  const out = {
+    ok: ok,
     folder: f.name || '',
     folderId: f.id || id,
-    account: tokenCache.account,
-    sharedDrive: f.driveId || sharedDriveId() || null
+    account: mode === 'oauth' ? 'oauth user' : tokenCache.account,
+    sharedDrive: actualDrive || configured || null,
+    mode: mode,
+    impersonating: impersonating || null,
+    message: message
   };
+  /* The browser client renders `error` for a rejected ping, so a known-broken
+     configuration must populate it as well as `message`. */
+  if (!ok) out.error = message;
+  return out;
 }
 
 async function actionFolder(body) {
@@ -366,6 +604,10 @@ async function actionUpload(body) {
         size: res.size || String(bytes.length), updated: true
       };
     } catch (e) {
+      /* A quota refusal is a site misconfiguration, not a stale id — retrying
+         as a create would re-send up to 12MB only to be refused again, and
+         would bury the actionable message under the second failure. */
+      if (e && e.quota) throw e;
       /* The file was deleted or emptied from the trash in Drive. Falling through
          to a create keeps the device usable instead of failing forever on a
          stale pdfDriveId; the caller stores the new id from this response. */

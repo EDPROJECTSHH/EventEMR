@@ -131,19 +131,74 @@ function changeProblem(d, i) {
 /* --------------------------------------------------------------- the store -- */
 
 let cachedStore = null;
-function blobs() {
+let blobsMode = 'unknown';
+
+/* When running in Lambda compatibility mode the Blobs environment is not set
+   up for us; the client library exposes connectLambda(event) for exactly this,
+   and it reads a base64 JSON blob off event.blobs carrying { url, token }.
+   Call it before getStore() so the legacy path is not dead weight. */
+function connectFromEvent(mod, event) {
+  if (!event) return;
+  try {
+    if (typeof mod.connectLambda === 'function') { mod.connectLambda(event); return; }
+  } catch (e) { /* fall through to the manual form below */ }
+  if (process.env.NETLIFY_BLOBS_CONTEXT || !event.blobs) return;
+  try {
+    const d = JSON.parse(Buffer.from(event.blobs, 'base64').toString('utf8'));
+    if (!d || !d.url || !d.token) return;
+    process.env.NETLIFY_BLOBS_CONTEXT = Buffer.from(JSON.stringify({
+      edgeURL: d.url,
+      token: d.token,
+      siteID: process.env.SITE_ID || process.env.NETLIFY_SITE_ID || d.siteID || '',
+      deployID: process.env.DEPLOY_ID || d.deployID || ''
+    })).toString('base64');
+  } catch (e) { /* leave it unset; blobs() reports honestly below */ }
+}
+
+function blobs(event) {
   if (cachedStore) return cachedStore;
   let mod;
   try {
     mod = require('@netlify/blobs');
   } catch (e) {
-    throw new Error('Netlify Blobs is unavailable in this runtime');
+    blobsMode = 'unavailable';
+    throw new Error(
+      'Netlify Blobs could not be loaded in this function runtime. ' +
+      'Redeploy from Git (not a drag-and-drop zip) so the functions runtime is complete.'
+    );
   }
   if (!mod || typeof mod.getStore !== 'function') {
-    throw new Error('Netlify Blobs is unavailable in this runtime');
+    blobsMode = 'unavailable';
+    throw new Error('Netlify Blobs loaded but exposes no getStore()');
   }
-  cachedStore = mod.getStore({ name: STORE_NAME, consistency: 'strong' });
+  connectFromEvent(mod, event);
+  try {
+    cachedStore = mod.getStore({ name: STORE_NAME, consistency: 'strong' });
+  } catch (e) {
+    blobsMode = 'unavailable';
+    throw new Error(
+      'Netlify Blobs is loaded but not configured for this runtime' +
+      (e && e.message ? ' (' + e.message + ')' : '') +
+      '. Enable Blobs under Site configuration -> Blobs, then redeploy.'
+    );
+  }
+  blobsMode = 'package';
   return cachedStore;
+}
+
+/* A GET returns the health of the store so an operator can see which path is
+   live without pushing any patient data through it. */
+function health() {
+  let detail = '';
+  try { blobs(null); detail = 'store reachable'; }
+  catch (e) { detail = (e && e.message) || String(e); }
+  return {
+    ok: blobsMode === 'package',
+    blobs: blobsMode,
+    store: STORE_NAME,
+    hasContext: !!process.env.NETLIFY_BLOBS_CONTEXT,
+    detail: detail
+  };
 }
 
 function metaKey(eventId, deviceId) { return eventId + '/meta/' + deviceId + '.json'; }
@@ -334,7 +389,7 @@ async function pull(store, eventId, deviceId, since) {
 
 /* ------------------------------------------------------------------ route -- */
 
-async function handleSync(body) {
+async function handleSync(body, event) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { status: 400, payload: { ok: false, error: 'Send a JSON object body' } };
   }
@@ -377,7 +432,7 @@ async function handleSync(body) {
     if (problem) return { status: 400, payload: { ok: false, error: problem } };
   }
 
-  const store = blobs();
+  const store = blobs(event);
   let accepted = 0;
   if (changes.length) {
     const res = await push(store, eventId, deviceId, changes);
@@ -445,10 +500,18 @@ async function route(req) {
   if (req.method === 'OPTIONS') {
     return { status: 204, headers: head, body: '' };
   }
+  if (req.method === 'GET') {
+    const h = health();
+    return {
+      status: h.ok ? 200 : 503,
+      headers: head,
+      body: JSON.stringify(h)
+    };
+  }
   if (req.method !== 'POST') {
     return {
       status: 405,
-      headers: Object.assign({ Allow: 'POST, OPTIONS' }, head),
+      headers: Object.assign({ Allow: 'GET, POST, OPTIONS' }, head),
       body: JSON.stringify({ ok: false, error: 'POST a JSON body to this endpoint' })
     };
   }
@@ -472,7 +535,7 @@ async function route(req) {
   }
 
   try {
-    const res = await handleSync(body);
+    const res = await handleSync(body, req.event);
     return { status: res.status, headers: head, body: JSON.stringify(res.payload) };
   } catch (e) {
     return {
@@ -523,14 +586,25 @@ async function handlerLegacy(event) {
     method: (event && (event.httpMethod || event.method)) || 'POST',
     origin: get('origin'),
     host: get('x-forwarded-host') || get('host'),
-    raw: raw
+    raw: raw,
+    event: event
   });
   return { statusCode: res.status, headers: res.headers, body: res.body };
 }
 
-module.exports = handlerLegacy;
-module.exports.handler = handlerLegacy;
+/* IMPORTANT — do not re-add `module.exports.handler`.
+   Netlify treats a CommonJS function that exports `handler` as a v1 /
+   Lambda-compatibility function, and in that mode it does NOT inject the
+   Netlify Blobs environment: NETLIFY_BLOBS_CONTEXT is unset and
+   @netlify/blobs is not provided by the runtime. The result is a function
+   that deploys fine, answers requests, and fails every single store call with
+   "Netlify Blobs is unavailable in this runtime" — which is exactly what
+   happened in production. Exporting only the v2 handler gets the configured
+   runtime. handlerLegacy stays available for local harnesses, but it is
+   deliberately NOT the module's `handler`. */
+module.exports = handlerV2;
 module.exports.default = handlerV2;
+module.exports.legacy = handlerLegacy;
 
 /* Pure helpers, exported for unit testing. */
 module.exports.mergeLWW = mergeLWW;
