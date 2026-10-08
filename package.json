@@ -1,0 +1,13 @@
+{
+  "name": "event-emr",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mini Emergency & Critical Care Event EMR — dependencies for the Netlify functions only. The browser app has none.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^10.7.13"
+  }
+}

@@ -6,8 +6,18 @@
 #    GDRIVE_FOLDER_ID             the folder you shared with that service account
 #    GDRIVE_SHARED_DRIVE_ID       optional, only for a Shared Drive
 #
-#  There is no npm install: the app is plain JavaScript and the build is a
-#  single Python script, so a deploy takes a couple of seconds.
+#  The browser app has no dependencies — it is plain JavaScript built by a
+#  single Python script. package.json exists only so Netlify installs
+#  @netlify/blobs for the sync function. Without it the function deploys and
+#  answers requests but every store call fails with "Netlify Blobs could not be
+#  loaded in this function runtime", and no post can see another post's
+#  patients. @netlify/blobs 11.x requires Node 22, so the 10.x line is pinned
+#  alongside an explicit NODE_VERSION.
+
+[build.environment]
+  # Explicit so the functions runtime cannot drift under the pinned
+  # @netlify/blobs 10.x (which needs Node >= 16).
+  NODE_VERSION = "20"
 
 [build]
   # dist/ is committed, so there is genuinely nothing the server has to build.
