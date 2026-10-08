@@ -463,14 +463,30 @@ async function actionPing() {
   let ok = true;
   let mode = 'serviceAccount';
   let message = '';
+  let oauthEmail = '';
   const am = authMode();
+  if (am.kind === 'oauth') {
+    /* Which human will own the files. Worth confirming out loud: the whole
+       point of this mode is that the quota being consumed is theirs. Wrapped
+       because ping must still answer if the field is ever unavailable. */
+    try {
+      const about = await drive('/about', { query: { fields: 'user(displayName,emailAddress),storageQuota' } });
+      const u = (about && about.user) || {};
+      oauthEmail = str(u.emailAddress) || str(u.displayName);
+      const q = (about && about.storageQuota) || {};
+      if (q.limit && q.usage) {
+        const freeGb = (Number(q.limit) - Number(q.usage)) / (1024 * 1024 * 1024);
+        if (isFinite(freeGb)) oauthEmail += ' (' + freeGb.toFixed(1) + ' GB free)';
+      }
+    } catch (e) { /* leave it blank; the mode is still correct */ }
+  }
   if (am.kind === 'oauth') {
     /* Acting as the human: the file is theirs and uses their quota, so a My
        Drive folder is perfectly fine and no shared drive is needed. */
     mode = 'oauth';
-    message = 'Signed in as a Google user via a refresh token: new files are ' +
-      'owned by that account and use their Drive quota. This is the path that ' +
-      'works on a personal @gmail.com account.';
+    message = 'Signed in as ' + (oauthEmail || 'a Google user') +
+      ' via a refresh token: new files are owned by that account and use its ' +
+      'Drive quota. This is the path that works on a personal @gmail.com account.';
   } else if (actualDrive) {
     mode = 'sharedDrive';
     message = 'Shared drive: new files are owned by the drive, not by the ' +
@@ -512,7 +528,7 @@ async function actionPing() {
     ok: ok,
     folder: f.name || '',
     folderId: f.id || id,
-    account: mode === 'oauth' ? 'oauth user' : tokenCache.account,
+    account: mode === 'oauth' ? (oauthEmail || 'oauth user') : tokenCache.account,
     sharedDrive: actualDrive || configured || null,
     mode: mode,
     impersonating: impersonating || null,
