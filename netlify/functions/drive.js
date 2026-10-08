@@ -72,12 +72,22 @@ const FILE_FIELDS = 'id,name,mimeType,size,modifiedTime,webViewLink,webContentLi
    medic two documentation links mid-event. Name both remedies in the terms of
    this site's own env vars instead. Kept short enough to survive niceError()'s
    400-character clamp once a prefix is added. */
+/* Three ways out, and which one applies depends on the Google account. Options
+   1 and 2 both require Google Workspace — Shared Drives do not exist on a
+   personal @gmail.com account and domain-wide delegation needs an Admin
+   console — so option 3 is the one that works for a personal account. */
 const QUOTA_FIX =
-  'a service account has no Drive storage, so it cannot own files in a My Drive ' +
-  'folder — sharing the folder with it is not enough. Either (1) move the folder ' +
-  'into a Shared Drive, add the service account as Content manager and set ' +
-  'GDRIVE_SHARED_DRIVE_ID, or (2) set GOOGLE_IMPERSONATE_USER to a Workspace ' +
-  'user with domain-wide delegation.';
+  'a service account has no Drive storage of its own, so it cannot own a file in ' +
+  'a My Drive folder — sharing the folder with it is not enough, because the new ' +
+  'file would still be owned by an account with zero quota. Three fixes: ' +
+  '(1) WORKSPACE ONLY — move the folder into a Shared Drive, add the service ' +
+  'account as Content manager, and set GDRIVE_SHARED_DRIVE_ID; ' +
+  '(2) WORKSPACE ONLY — set GOOGLE_IMPERSONATE_USER to a user whose Admin console ' +
+  'grants this service account domain-wide delegation; or ' +
+  '(3) ANY ACCOUNT, INCLUDING PERSONAL GMAIL — upload as yourself instead of as ' +
+  'the service account by setting GOOGLE_OAUTH_CLIENT_ID, ' +
+  'GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN; files are then ' +
+  'owned by you and use your own 15 GB.';
 
 /* ---------------------------------------------------------------- helpers -- */
 
