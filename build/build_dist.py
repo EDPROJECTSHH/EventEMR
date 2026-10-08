@@ -181,7 +181,7 @@ def build():
     os.makedirs(os.path.join(DIST, 'assets'), exist_ok=True)
     for a in os.listdir(os.path.join(SRC, 'assets')):
         shutil.copyfile(os.path.join(SRC, 'assets', a), os.path.join(DIST, 'assets', a))
-    for extra in ('sw.js', 'manifest.webmanifest'):
+    for extra in ('sw.js', 'manifest.webmanifest', 'privacy.html', 'terms.html'):
         p = os.path.join(SRC, extra)
         if os.path.exists(p):
             shutil.copyfile(p, os.path.join(DIST, extra))
