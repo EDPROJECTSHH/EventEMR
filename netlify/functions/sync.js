@@ -201,6 +201,15 @@ function health() {
   };
 }
 
+/* The event index — the one thing readable WITHOUT already knowing an event id.
+   Everything else here is keyed by eventId, so a device that has never joined
+   an event has nothing it can ask for: it cannot discover one, and the landing
+   page fell through to creating a SECOND event instead of joining the first.
+   Entries are the whole event record rather than a summary, so the client can
+   merge them straight into its store and every existing screen keeps working. */
+const IDX_PREFIX = 'index/';
+function idxKey(eventId) { return IDX_PREFIX + eventId + '.json'; }
+
 function metaKey(eventId, deviceId) { return eventId + '/meta/' + deviceId + '.json'; }
 function devKey(eventId, deviceId) { return eventId + '/dev/' + deviceId + '.json'; }
 
@@ -238,6 +247,75 @@ async function listDevices(store, eventId) {
 
 /* Merge the caller's changes into the caller's own blob. Returns the server
    stamp written, which becomes that blob's lastWrite. */
+/* Every event id ever pushed, read out of the '<eventId>/meta/' namespace. This
+   is the backfill path: events created before the index existed have no entry,
+   and without this they would stay invisible forever. */
+async function listEventIds(store) {
+  let res;
+  try {
+    res = await store.list();
+  } catch (e) {
+    throw new Error('Could not list the events: ' + niceError(e));
+  }
+  const found = (res && res.blobs) || [];
+  const ids = {};
+  for (let i = 0; i < found.length; i++) {
+    const key = (found[i] && found[i].key) || '';
+    if (key.indexOf(IDX_PREFIX) === 0) continue;
+    const slash = key.indexOf('/');
+    if (slash <= 0) continue;
+    const id = key.slice(0, slash);
+    if (ID_RE.test(id)) ids[id] = true;
+  }
+  return Object.keys(ids);
+}
+
+/* Recover an event record from the device blobs that carry it, newest wins. */
+async function recoverEvent(store, eventId) {
+  const devices = await listDevices(store, eventId);
+  let best = null;
+  for (let i = 0; i < devices.length; i++) {
+    const blob = await readJson(store, devKey(eventId, devices[i]));
+    const recs = (blob && blob.records && typeof blob.records === 'object') ? blob.records : {};
+    const d = recs['event:' + eventId];
+    if (d && wins(best, d)) best = d;
+  }
+  return best;
+}
+
+async function listEvents(store) {
+  const out = {};
+  let res;
+  try {
+    res = await store.list({ prefix: IDX_PREFIX });
+  } catch (e) {
+    throw new Error('Could not list the events: ' + niceError(e));
+  }
+  const found = (res && res.blobs) || [];
+  const reads = [];
+  for (let i = 0; i < found.length; i++) {
+    const key = (found[i] && found[i].key) || '';
+    if (key.indexOf(IDX_PREFIX) === 0) reads.push(readJson(store, key));
+  }
+  const rows = await Promise.all(reads);
+  for (let i = 0; i < rows.length; i++) {
+    const ev = rows[i];
+    if (ev && ev._t === 'event' && typeof ev.id === 'string') out[ev.id] = ev;
+  }
+
+  /* Backfill anything the index never saw, then write the entry so the walk
+     over the device blobs happens once rather than on every landing page. */
+  const ids = await listEventIds(store);
+  for (let i = 0; i < ids.length; i++) {
+    if (out[ids[i]]) continue;
+    const ev = await recoverEvent(store, ids[i]);
+    if (!ev || ev._t !== 'event' || typeof ev.id !== 'string') continue;
+    out[ev.id] = ev;
+    try { await store.setJSON(idxKey(ev.id), ev); } catch (e) { /* best effort */ }
+  }
+  return Object.keys(out).map(function (k) { return out[k]; });
+}
+
 async function push(store, eventId, deviceId, changes) {
   const dk = devKey(eventId, deviceId);
   const blob = (await readJson(store, dk)) || {};
@@ -259,6 +337,19 @@ async function push(store, eventId, deviceId, changes) {
     records[k] = d;
     at[k] = stamp + accepted;
     accepted++;
+  }
+
+  /* LWW against the stored entry, so a device replaying a stale copy cannot roll
+     the index back. Never let a lagging index fail the push that carried it. */
+  for (let i = 0; i < changes.length; i++) {
+    const d = changes[i];
+    if (!d || d._t !== 'event') continue;
+    const eid = typeof d.id === 'string' ? d.id : '';
+    if (!ID_RE.test(eid)) continue;
+    try {
+      const cur = await readJson(store, idxKey(eid));
+      if (wins(cur, d)) await store.setJSON(idxKey(eid), d);
+    } catch (e) { /* the push is what matters */ }
   }
 
   const last = accepted ? stamp + accepted - 1 : prev;
@@ -392,6 +483,14 @@ async function pull(store, eventId, deviceId, since) {
 async function handleSync(body, event) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { status: 400, payload: { ok: false, error: 'Send a JSON object body' } };
+  }
+
+  /* Discovery. Deliberately the only action that needs no eventId — a device
+     that has never joined an event has none to send. */
+  if (body.action === 'events') {
+    const store = blobs(event);
+    const events = await listEvents(store);
+    return { status: 200, payload: { ok: true, events: events } };
   }
 
   const eventId = typeof body.eventId === 'string' ? body.eventId : '';
@@ -610,6 +709,7 @@ module.exports.legacy = handlerLegacy;
 module.exports.mergeLWW = mergeLWW;
 module.exports.wins = wins;
 module.exports.docKey = docKey;
+module.exports.idxKey = idxKey;
 module.exports.changeProblem = changeProblem;
 module.exports.niceError = niceError;
 module.exports.allowOrigin = allowOrigin;
