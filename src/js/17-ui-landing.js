@@ -170,7 +170,7 @@
           class: 'small muted grow',
           text: 'No posts yet — an admin must add them before anyone can join.'
         }));
-        f.appendChild(UI.btn('Set up posts', '', function () { adminInto(ev); }, 'gear'));
+        f.appendChild(UI.btn('Set up posts', '', function () { adminInto(ev); }, 'lock'));
       } else {
         f.appendChild(UI.btn('Join this event', 'pri', function () { joinFlow(ev); }, 'check'));
       }
@@ -318,6 +318,66 @@
   }
 
   /* ---- join --------------------------------------------------------------- */
+  /* Every device that joins a post must present that post's own join code. The
+     Command Center issues them, and Settings → Posts is the only place a post
+     can be created at all, so no team — an ambulance crew included — can file
+     records against a post unless the Command Center handed over its code.
+     Posts made before codes existed have none; those ask for the admin passcode
+     instead, so an old event is never a way in and never a lockout either. */
+  function askJoinCode(post) {
+    var want = String((post && post.joinCode) || '').trim();
+    if (!want) {
+      return UI.requireUnlock('This post has no join code yet. The admin passcode will do — ' +
+        'or ask the Command Center to issue one.');
+    }
+    return new Promise(function (resolve) {
+      var done = false;
+      var tries = 0;
+      var input = EV.el('input', {
+        type: 'password', inputmode: 'numeric', autocomplete: 'off', maxlength: 8,
+        placeholder: '••••',
+        style: {
+          fontFamily: 'var(--font-mono)', fontSize: '26px', letterSpacing: '.3em',
+          textAlign: 'center', padding: '12px', width: '100%',
+          border: '1px solid var(--line)', borderRadius: '8px', background: 'var(--ground)'
+        }
+      });
+      var err = EV.el('div', { class: 'err', style: { minHeight: '16px' } });
+      var sh = UI.sheet({
+        title: 'Join code — ' + ((post && (post.code || post.name)) || 'this post'),
+        body: EV.el('div', { class: 'stack' }, [
+          EV.el('p', {
+            class: 'muted', style: { margin: 0 },
+            text: 'The Command Center issues this code. Ask for it before you start recording here.'
+          }),
+          input, err
+        ]),
+        footer: [],
+        onClose: function () { if (!done) resolve(false); }
+      });
+      function submit() {
+        if (String(input.value).trim() === want) {
+          done = true;
+          sh.close();
+          resolve(true);
+          return;
+        }
+        tries++;
+        err.textContent = tries >= 3
+          ? 'Still no match — ask the Command Center to read the code out again.'
+          : 'That code does not match this post.';
+        input.value = '';
+        input.focus();
+      }
+      input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
+      sh.setFooter([
+        UI.btn('Cancel', '', function () { sh.close(); }),
+        UI.btn('Join', 'pri', submit, 'check')
+      ]);
+      setTimeout(function () { input.focus(); }, 40);
+    });
+  }
+
   function joinFlow(ev) {
     EV.settings.eventId = ev.id;
     EV.save();
@@ -376,8 +436,12 @@
         UI.btn('Cancel', '', function () { sh.close(); }),
         UI.btn('Next — your team', 'pri', function () {
           if (!sel.input.value) { sel.setError('Choose the post'); return; }
-          chosen.postId = sel.input.value;
-          stepTeam();
+          var pid = sel.input.value;
+          askJoinCode(EV.store.get('post', pid)).then(function (ok) {
+            if (!ok) return;
+            chosen.postId = pid;
+            stepTeam();
+          });
         })
       ]);
     }
@@ -493,30 +557,43 @@
   /* An admin setting an event up has not joined a post yet, so bind the device
      to the Command Center (creating one if the event has none) — otherwise the
      settings screens have no identity to work from. */
+  /* The Command Center is unrestricted access to every post on the event, and
+     this is the only function that hands it out. The passcode is asked for HERE
+     rather than at each call site, because it was a call site that leaked: the
+     event card's own "Set up posts" button walked straight in, so anyone who
+     merely opened the URL could take Command Center on someone else's event.
+     Gating the function means no future caller can reopen that hole. Nothing is
+     written before the check — not even settings.eventId — so a refused prompt
+     leaves the device exactly as it was. requireUnlock short-circuits inside its
+     15-minute window, so arriving here from admin login never asks twice. */
   function adminInto(ev) {
-    EV.settings.eventId = ev.id;
-    EV.save();
-    var cp = EV.store.all('post', function (p) {
-      return p.eventId === ev.id && p.isCommandCenter;
-    })[0];
-    var ready = cp ? Promise.resolve(cp) : (function () {
-      var post = EV.model.newPost({
-        eventId: ev.id, code: 'CMD', name: 'Command Center',
-        kind: 'command', isCommandCenter: true, sort: 0
-      });
-      return EV.store.put(post).then(function () {
-        var e2 = EV.clone(EV.store.get('event', ev.id));
-        e2.commandPostId = post.id;
-        return EV.store.put(e2).then(function () { return post; });
-      });
-    })();
+    return UI.requireUnlock('Signing in at the Command Center needs the admin passcode.')
+      .then(function (ok) {
+        if (!ok) return;
+        EV.settings.eventId = ev.id;
+        EV.save();
+        var cp = EV.store.all('post', function (p) {
+          return p.eventId === ev.id && p.isCommandCenter;
+        })[0];
+        var ready = cp ? Promise.resolve(cp) : (function () {
+          var post = EV.model.newPost({
+            eventId: ev.id, code: 'CMD', name: 'Command Center',
+            kind: 'command', isCommandCenter: true, sort: 0
+          });
+          return EV.store.put(post).then(function () {
+            var e2 = EV.clone(EV.store.get('event', ev.id));
+            e2.commandPostId = post.id;
+            return EV.store.put(e2).then(function () { return post; });
+          });
+        })();
 
-    ready.then(function (post) {
-      EV.model.bind(ev.id, post.id, EV.model.team().length ? EV.model.team() : [{ name: 'Admin', role: 'Logistic' }]);
-      EV.model.grantSuper();
-      EV.toast('Signed in at the Command Center', 'ok');
-      UI.go('settings', 'posts');
-    });
+        return ready.then(function (post) {
+          EV.model.bind(ev.id, post.id, EV.model.team().length ? EV.model.team() : [{ name: 'Admin', role: 'Logistic' }]);
+          EV.model.grantSuper();
+          EV.toast('Signed in at the Command Center', 'ok');
+          UI.go('settings', 'posts');
+        });
+      });
   }
 
   function reopen(ev) {

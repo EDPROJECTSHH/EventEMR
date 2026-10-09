@@ -358,7 +358,7 @@
     postId: '',
     deviceLabel: '',
     theme: 'light',
-    sync: { enabled: true, endpoint: '/api/sync', intervalMs: 15000 },
+    sync: { enabled: true, endpoint: '/api/sync', intervalMs: 4000 },
     drive: {
       enabled: false, endpoint: '/api/drive', folderName: '',
       autoUpload: true, uploadOn: 'close', eventFolderId: '', patientsFolderId: ''
@@ -401,6 +401,15 @@
   EV.hashPass = function (code) { return EV.fnv(EV.PASS_SALT + String(code || '')); };
   if (!EV.settings.passcodeHash) {
     EV.settings.passcodeHash = EV.hashPass('89370');
+    EV.save();
+  }
+
+  /* Posts have to see each other's patients within seconds — a transfer called
+     over the radio arrives before the record does otherwise. Devices that saved
+     the old 15s default keep it in localStorage, so migrate them here; a stale
+     stored value would quietly pin a tablet slow for the whole event. */
+  if (!EV.settings.sync.intervalMs || EV.settings.sync.intervalMs >= 15000) {
+    EV.settings.sync.intervalMs = 4000;
     EV.save();
   }
 

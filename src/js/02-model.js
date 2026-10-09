@@ -42,6 +42,7 @@
     { v: 'first-aid', l: 'First aid post', icon: '+' },
     { v: 'ice-bath', l: 'Cooling / ice bath', icon: '❄' },
     { v: 'roaming', l: 'Roaming team', icon: '⇢' },
+    { v: 'ambulance', l: 'Ambulance / transport', icon: '⇄' },
     { v: 'command', l: 'Command post', icon: '★' }
   ];
   M.BED_KINDS = [
@@ -184,12 +185,20 @@
     return Math.max(0, ev.concludedAt + M.REOPEN_WINDOW - (now || EV.now()));
   };
 
+  /* The code a team types to join a post. Four digits: long enough that it is
+     not guessed in the three tries the join sheet allows, short enough to read
+     out over a radio in a noisy tent. Issued by the Command Center, which is
+     the only place posts can be created. */
+  M.newJoinCode = function () {
+    return String(1000 + Math.floor(Math.random() * 9000));
+  };
+
   M.newPost = function (o) {
     return Object.assign({
       _t: 'post', id: EV.uid('po'), eventId: EV.settings.eventId,
       code: '', name: '', kind: 'medical-tent', location: '',
       staff: [], active: true, sort: 0, seq: 0,
-      isCommandCenter: false
+      isCommandCenter: false, joinCode: M.newJoinCode()
     }, o || {});
   };
 
@@ -205,7 +214,8 @@
     return Object.assign({
       _t: 'ambulance', id: EV.uid('am'), eventId: EV.settings.eventId,
       callsign: '', plate: '', crew: [], kind: 'bls',
-      status: 'available', patientId: null, destination: '', active: true
+      status: 'available', patientId: null, destination: '', active: true,
+      joinCode: M.newJoinCode()
     }, o || {});
   };
 

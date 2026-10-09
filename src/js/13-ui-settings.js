@@ -194,6 +194,13 @@
     posts.forEach(function (post) {
       var beds = EV.model.beds(post.id);
       var head = EV.el('div', { class: 'row tight' }, [
+        /* Read out to the team on arrival — this screen is Command-Center-only,
+           so the codes are visible exactly where they are handed over. */
+        EV.el('span', {
+          class: 'tag mono',
+          title: 'The code this post\u2019s team types to join',
+          text: 'Join ' + (post.joinCode || 'not set')
+        }),
         UI.btn('Edit', 'sm ghost', function () { postSheet(post); }),
         UI.btn('Add bed', 'sm', function () { bedSheet(post); }, 'plus')
       ]);
@@ -310,7 +317,26 @@
       options: EV.model.POST_KINDS.map(function (k) { return { v: k.v, l: k.l }; })
     });
     var loc = UI.field({ label: 'Location', value: p.location, cls: 'sm', placeholder: 'Gate 7 / Hall B / Stand 14' });
-    body.appendChild(EV.el('div', { class: 'fgrid' }, [code, EV.el('div', { class: 'w2' }, [name]), kind, loc]));
+
+    /* Posts created before join codes existed have none — give them one as soon
+       as the Command Center opens the post, so there is nothing left to forget. */
+    if (!p.joinCode) p.joinCode = EV.model.newJoinCode();
+    var join = UI.field({
+      label: 'Join code', value: p.joinCode, cls: 'sm', maxlength: 8,
+      hint: 'The team types this to join', placeholder: '0000'
+    });
+    body.appendChild(EV.el('div', { class: 'fgrid' }, [
+      code, EV.el('div', { class: 'w2' }, [name]), kind, loc, join
+    ]));
+    body.appendChild(EV.el('div', { class: 'row tight' }, [
+      UI.btn('Issue a new code', 'sm ghost', function () {
+        join.input.value = EV.model.newJoinCode();
+      }),
+      EV.el('span', {
+        class: 'tiny muted',
+        text: 'Changing it does not sign out devices already working at this post.'
+      })
+    ]));
 
     /* The Command Center is where unrestricted access lives, so moving it is
        itself passcode-gated — otherwise the lock means nothing. */
@@ -397,6 +423,7 @@
         p.name = name.input.value.trim();
         p.kind = kind.input.value;
         p.location = loc.input.value.trim();
+        p.joinCode = String(join.input.value || '').trim() || EV.model.newJoinCode();
         p.staff = staff.filter(function (s) { return String(s.name).trim(); });
         p.isCommandCenter = wantCC;
         var extra = [];

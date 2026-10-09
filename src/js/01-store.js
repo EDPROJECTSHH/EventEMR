@@ -167,8 +167,23 @@
 
     EV.emit('change', { type: doc._t, id: doc.id, doc: doc });
     EV.emit('change:' + doc._t, doc);
+    nudgeSync();
     return Promise.all([persist(doc), persistOutbox(k, doc)]).then(function () { return doc; });
   };
+
+  /* The interval is the ceiling on how stale a reader can be, not how long a
+     writer waits: a local edit goes up almost immediately, so a patient booked
+     in at one post shows at the others in about a second. Debounced, so typing
+     a name is one request rather than one per keystroke. */
+  var nudgeTimer = null;
+  function nudgeSync() {
+    if (nudgeTimer) return;
+    if (!EV.settings.sync.enabled || !EV.settings.eventId) return;
+    nudgeTimer = setTimeout(function () {
+      nudgeTimer = null;
+      store.sync();
+    }, 350);
+  }
 
   /* Soft delete. A tombstone still syncs, otherwise a record deleted on one
      post reappears the next time another post pushes its copy. */
@@ -311,7 +326,10 @@
       s.lastError = s.error;
       s.failures++;
       s.online = EV.online();
-      backoff = Math.min(backoff ? backoff * 2 : 1, 16);
+      /* Capped lower than it looks: at a 4s base this tops out around half a
+         minute, so a post that drops off the network rejoins quickly instead of
+         sitting out a four-minute backoff. */
+      backoff = Math.min(backoff ? backoff * 2 : 1, 8);
       EV.logError('store.sync', e);
     }).then(function () {
       s.busy = false;
