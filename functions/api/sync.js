@@ -130,18 +130,18 @@ function changeProblem(d, i) {
 
 /* --------------------------------------------------------------- the store -- */
 
-/* ---------------------------------------------------------- the store (R2) --
-   R2 stands in for Netlify Blobs, and it is the right one of Cloudflare's
-   three. KV is eventually consistent and allows 1,000 writes a day on the free
-   plan — a single event would spend that before lunch, and a handover another
-   post cannot see yet is worse than no sync at all. D1 would mean rewriting
-   every read as SQL. R2 is an object store with the same get / put /
-   list-by-prefix shape AND strong read-after-write consistency, which is
-   exactly what a transfer depends on: a patient moved at 14:02 has to be
-   visible at the receiving post at 14:02, not when a cache happens to expire.
-   The adapter is deliberately shaped like the Netlify Blobs client, so
-   everything built on top of it is untouched. */
-const BUCKET_BINDING = 'EVENT_EMR';
+/* ---------------------------------------------------------- the store (D1) --
+   D1 stands in for Netlify Blobs, and it is the right one of Cloudflare's three
+   on this account. R2 cannot create a bucket until a billing subscription is
+   added. KV allows 1,000 writes a day on the free plan — a single event would
+   spend that before lunch — and it is eventually consistent, so a handover the
+   receiving post cannot see yet is worse than no sync at all. D1 is free, needs
+   no subscription, and its reads go to the primary: a patient moved at 14:02 is
+   visible at the other post at 14:02.
+
+   The table is a plain key/value pair and the adapter is shaped exactly like
+   the Netlify Blobs client, so every line built on top of it is untouched. */
+const DB_BINDING = 'EVENT_EMR';
 
 /* Set once per request. A Worker has no Node environment object; bindings and
    plain variables both arrive together on `env`. */
@@ -150,62 +150,73 @@ let ENV = {};
 const ENC = new TextEncoder();
 function utf8Len(s) { return ENC.encode(String(s == null ? '' : s)).length; }
 
-function r2(env) {
-  const bucket = env && env[BUCKET_BINDING];
-  if (!bucket) {
+/* Created on first use and remembered per isolate, so the DDL is not a round
+   trip on every request. Cleared on failure so a cold start can retry. */
+let schemaReady = null;
+
+function db(env) {
+  const d1 = env && env[DB_BINDING];
+  if (!d1 || typeof d1.prepare !== 'function') {
     throw new Error(
-      'The R2 bucket binding "' + BUCKET_BINDING + '" is missing. In the Cloudflare ' +
-      'dashboard open Workers & Pages -> this project -> Settings -> Bindings and add ' +
-      'an R2 bucket binding called ' + BUCKET_BINDING + ', then redeploy.'
+      'The D1 binding "' + DB_BINDING + '" is missing. In the Cloudflare dashboard open ' +
+      'Workers & Pages -> this project -> Settings -> Bindings, add a D1 database binding ' +
+      'called ' + DB_BINDING + ' pointing at the eventemr database, then redeploy.'
     );
+  }
+  if (!schemaReady) {
+    schemaReady = d1
+      .prepare('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)')
+      .run()
+      .catch(function (e) { schemaReady = null; throw e; });
   }
   return {
     async get(key) {
-      const obj = await bucket.get(key);
-      if (!obj) return null;
-      try { return JSON.parse(await obj.text()); } catch (e) { return null; }
+      await schemaReady;
+      const row = await d1.prepare('SELECT v FROM kv WHERE k = ?').bind(key).first();
+      if (!row || !row.v) return null;
+      try { return JSON.parse(row.v); } catch (e) { return null; }
     },
     async setJSON(key, value) {
-      await bucket.put(key, JSON.stringify(value), {
-        httpMetadata: { contentType: 'application/json' }
-      });
+      await schemaReady;
+      await d1
+        .prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
+        .bind(key, JSON.stringify(value))
+        .run();
     },
     async list(opts) {
-      const prefix = (opts && opts.prefix) || undefined;
-      const out = [];
-      let cursor;
-      /* R2 pages at 1000 objects. An event with many devices needs every page,
-         or a pull silently misses whichever posts sort last. */
-      for (;;) {
-        const res = await bucket.list({ prefix: prefix, cursor: cursor, limit: 1000 });
-        const objs = (res && res.objects) || [];
-        for (let i = 0; i < objs.length; i++) out.push({ key: objs[i].key });
-        if (!res || !res.truncated) break;
-        cursor = res.cursor;
-      }
-      return { blobs: out };
+      await schemaReady;
+      const prefix = (opts && opts.prefix) || '';
+      /* LIKE needs an explicit ESCAPE: an unescaped _ matches any character, so
+         a prefix carrying one would quietly match other events' keys too. */
+      const like = prefix.replace(/([\\%_])/g, '\\$1') + '%';
+      const res = await d1
+        .prepare("SELECT k FROM kv WHERE k LIKE ? ESCAPE '\\' ORDER BY k")
+        .bind(like)
+        .all();
+      const rows = (res && res.results) || [];
+      return { blobs: rows.map(function (r) { return { key: r.k }; }) };
     }
   };
 }
 
-/* A GET reports whether the bucket is genuinely reachable, so an operator can
+/* A GET reports whether the database is genuinely reachable, so an operator can
    tell a missing binding from a broken deploy without pushing patient data
-   through it. The check is a real round trip, not just a binding test. */
+   through it. The check is a real query, not just a binding test. */
 async function health(env) {
   let detail = '';
   let ok = false;
   try {
-    const store = r2(env);
+    const store = db(env);
     await store.get('index/__health__.json');
-    detail = 'bucket reachable';
+    detail = 'database reachable';
     ok = true;
   } catch (e) {
     detail = (e && e.message) || String(e);
   }
   return {
     ok: ok,
-    blobs: ok ? 'r2' : 'unavailable',
-    store: BUCKET_BINDING,
+    blobs: ok ? 'd1' : 'unavailable',
+    store: DB_BINDING,
     platform: 'cloudflare-pages',
     detail: detail
   };
@@ -498,7 +509,7 @@ async function handleSync(body, event) {
   /* Discovery. Deliberately the only action that needs no eventId — a device
      that has never joined an event has none to send. */
   if (body.action === 'events') {
-    const store = r2(ENV);
+    const store = db(ENV);
     const events = await listEvents(store);
     return { status: 200, payload: { ok: true, events: events } };
   }
@@ -541,7 +552,7 @@ async function handleSync(body, event) {
     if (problem) return { status: 400, payload: { ok: false, error: problem } };
   }
 
-  const store = r2(ENV);
+  const store = db(ENV);
   let accepted = 0;
   if (changes.length) {
     const res = await push(store, eventId, deviceId, changes);
