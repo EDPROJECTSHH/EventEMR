@@ -208,7 +208,7 @@
       var body = EV.el('div', { class: 'stack tight' });
       body.appendChild(EV.el('div', {
         class: 'small muted',
-        text: (EV.model.POST_KINDS.filter(function (k) { return k.v === post.kind; })[0] || {}).l +
+        text: EV.model.postKind(post).l +
           (post.location ? ' · ' + post.location : '') +
           ' · ' + beds.length + ' bed' + (beds.length === 1 ? '' : 's') +
           (post.staff && post.staff.length ? ' · ' + post.staff.length + ' staff' : '')

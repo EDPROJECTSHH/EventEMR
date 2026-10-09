@@ -90,7 +90,10 @@
       var docs = res[0], pend = res[1], i;
       for (i = 0; i < docs.length; i++) {
         var doc = docs[i];
-        bucket(doc._t)[doc.id] = doc;
+        /* Heals records stored before the fill existed, so a bad row cannot
+           keep crashing the board on every launch. */
+        bucket(doc._t)[doc.id] = (EV.model && EV.model.fillDefaults)
+          ? EV.model.fillDefaults(doc) : doc;
       }
       for (i = 0; i < pend.length; i++) outbox[pend[i]._k] = pend[i].doc;
       store.syncState.pending = Object.keys(outbox).length;
@@ -202,6 +205,7 @@
     for (i = 0; i < (docs || []).length; i++) {
       var inc = docs[i];
       if (!inc || !inc._t || !inc.id) continue;
+      if (EV.model && EV.model.fillDefaults) inc = EV.model.fillDefaults(inc);
       var cur = bucket(inc._t)[inc.id];
       if (cur && !newer(inc, cur)) continue;
       bucket(inc._t)[inc.id] = inc;

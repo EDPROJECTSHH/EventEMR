@@ -147,10 +147,22 @@
     }));
     b.appendChild(top);
 
-    b.appendChild(EV.el('div', { class: 'row tight small muted', style: { marginTop: '8px' } }, [
-      EV.el('span', { text: posts.length + ' post' + (posts.length === 1 ? '' : 's') }),
-      EV.el('span', { text: open + ' open patient' + (open === 1 ? '' : 's') })
-    ]));
+    /* Discovery brings the event record, not the event's posts: a device that
+       has never joined holds none of its records, so the local store cannot
+       answer "how many posts". Printing "0 posts" there is simply false, and
+       the footer below used it to send an arriving team down the Command
+       Center path instead of the join they came for. Only report counts for an
+       event this device actually carries. */
+    var known = posts.length > 0 || EV.settings.eventId === ev.id;
+    b.appendChild(known
+      ? EV.el('div', { class: 'row tight small muted', style: { marginTop: '8px' } }, [
+          EV.el('span', { text: posts.length + ' post' + (posts.length === 1 ? '' : 's') }),
+          EV.el('span', { text: open + ' open patient' + (open === 1 ? '' : 's') })
+        ])
+      : EV.el('div', {
+          class: 'small muted', style: { marginTop: '8px' },
+          text: 'Not on this device yet — joining will load it.'
+        }));
 
     if (status === 'concluded') {
       var left = EV.model.reopenLeft(ev);
@@ -165,7 +177,7 @@
 
     var f = EV.el('div', { class: 'card-f' });
     if (status === 'active') {
-      if (!posts.length) {
+      if (known && !posts.length) {
         f.appendChild(EV.el('span', {
           class: 'small muted grow',
           text: 'No posts yet — an admin must add them before anyone can join.'
@@ -381,7 +393,16 @@
   function joinFlow(ev) {
     EV.settings.eventId = ev.id;
     EV.save();
+    /* Binding the device to the event is what lets sync ask for it at all, so
+       pull once before reading the post list. Without this the first join on a
+       new tablet sees an empty store, concludes the event has no posts and
+       diverts to the Command Center — the opposite of what the team wants. */
+    EV.toast('Loading the event…', '', 1500);
+    EV.store.sync({ full: true })['catch'](function () { /* offline: use what we hold */ })
+      .then(function () { openJoin(ev); });
+  }
 
+  function openJoin(ev) {
     var posts = EV.sortBy(EV.store.all('post', function (p) {
       return p.eventId === ev.id && p.active !== false;
     }), 'sort');

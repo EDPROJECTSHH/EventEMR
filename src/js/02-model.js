@@ -202,6 +202,38 @@
     }, o || {});
   };
 
+  /* A patient record can reach this device missing fields it assumes: pushed
+     by an older build, written by a half-finished import, or — as happened on
+     the first Cloudflare board — created straight through the sync API. One
+     such record used to throw "Cannot read properties of undefined" and take
+     the ENTIRE board down, which in a tent means the post loses its patient
+     list outright. Far better to heal the record at the boundary than to guard
+     every read of it. Only the array fields are filled: inventing an id, an MRN
+     or a timestamp would be worse than the crash. */
+  /* Resolving a post's type in one place, because both the board and the
+     settings list used to print the literal word "undefined" for a post whose
+     kind was unset or came from a build that did not have that kind yet. */
+  M.postKind = function (post) {
+    var want = post && post.kind;
+    var hit = M.POST_KINDS.filter(function (k) { return k.v === want; })[0];
+    if (hit) return hit;
+    return { v: want || '', l: want || 'Post', icon: '\u2022' };
+  };
+
+  M.PATIENT_ARRAYS = ['vitals', 'orders', 'cppt', 'transfers'];
+
+  M.fillDefaults = function (doc) {
+    if (!doc || doc._t !== 'patient') return doc;
+    var out = doc, patched = false;
+    for (var i = 0; i < M.PATIENT_ARRAYS.length; i++) {
+      var k = M.PATIENT_ARRAYS[i];
+      if (Array.isArray(doc[k])) continue;
+      if (!patched) { out = EV.clone(doc); patched = true; }
+      out[k] = [];
+    }
+    return out;
+  };
+
   M.newBed = function (o) {
     return Object.assign({
       _t: 'bed', id: EV.uid('bd'), postId: '', label: '',
@@ -413,7 +445,7 @@
     if (open && ac.v && ac.v <= 2 && EV.has(d.vitalsAgeMs) && d.vitalsAgeMs > 15 * 60000) {
       f.push({ k: 'stale', l: 'No vitals for ' + EV.durShort(d.vitalsAgeMs), sev: 1 });
     }
-    if (open && ac.v && ac.v <= 2 && !p.vitals.length) {
+    if (open && ac.v && ac.v <= 2 && !(p.vitals || []).length) {
       f.push({ k: 'novitals', l: 'No vitals recorded', sev: 2 });
     }
     if (d.overTarget) f.push({ k: 'los', l: 'Open ' + d.los + ' at ' + ac.s, sev: 1 });

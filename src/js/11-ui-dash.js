@@ -267,8 +267,7 @@
     var patients = EV.model.openPatients(post.id);
     var bs = EV.model.bedState(post.id);
     var mine = post.id === EV.model.boundPostId();
-    var kind = EV.model.POST_KINDS.filter(function (k) { return k.v === post.kind; })[0] ||
-      { l: post.kind, icon: '•' };
+    var kind = EV.model.postKind(post);
 
     var card = EV.el('section', {
       class: 'post' + (post.isCommandCenter ? ' is-command' : '') + (mine ? ' is-mine' : '')
