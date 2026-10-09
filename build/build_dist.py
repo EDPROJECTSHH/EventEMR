@@ -21,6 +21,8 @@ import os
 import re
 import shutil
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -181,10 +183,19 @@ def build():
     os.makedirs(os.path.join(DIST, 'assets'), exist_ok=True)
     for a in os.listdir(os.path.join(SRC, 'assets')):
         shutil.copyfile(os.path.join(SRC, 'assets', a), os.path.join(DIST, 'assets', a))
-    for extra in ('sw.js', 'manifest.webmanifest', 'privacy.html', 'terms.html'):
+    for extra in ('sw.js', 'manifest.webmanifest', 'privacy.html', 'terms.html',
+                  '_headers', '_redirects'):
         p = os.path.join(SRC, extra)
         if os.path.exists(p):
             shutil.copyfile(p, os.path.join(DIST, extra))
+
+    # The Cloudflare Pages worker is generated from functions/api/*.js here, so
+    # editing a function is enough — there is no separate step to forget.
+    try:
+        import build_worker
+        build_worker.build()
+    except Exception as e:
+        print('  (worker not rebuilt: %s)' % e)
 
     # ---------------- Artifact build ----------------
     # Body-only, everything inlined, reference trimmed to the three sections a
