@@ -1,0 +1,8 @@
+# Single-page app: any unknown path falls back to the shell so a post can
+# bookmark #/patient/<id> and refresh it.
+#
+# /api/* needs no rule here. Netlify required a redirect into
+# /.netlify/functions/:splat; Cloudflare Pages routes by file path, so
+# functions/api/sync.js already answers /api/sync and Functions are matched
+# before this catch-all is considered.
+/*  /index.html  200
