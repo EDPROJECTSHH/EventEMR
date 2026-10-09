@@ -15,7 +15,7 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
   'use strict';
 
   EV.VERSION = '1.0.0';
-  EV.BUILD = '2026-10-09 06:37';
+  EV.BUILD = '2026-10-09 10:25';
 
   /* ---- ids ---------------------------------------------------------------
      Sortable by creation: base36 ms timestamp + 5 random chars. Two records
@@ -365,7 +365,7 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
     postId: '',
     deviceLabel: '',
     theme: 'light',
-    sync: { enabled: true, endpoint: '/api/sync', intervalMs: 15000 },
+    sync: { enabled: true, endpoint: '/api/sync', intervalMs: 4000 },
     drive: {
       enabled: false, endpoint: '/api/drive', folderName: '',
       autoUpload: true, uploadOn: 'close', eventFolderId: '', patientsFolderId: ''
@@ -408,6 +408,15 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
   EV.hashPass = function (code) { return EV.fnv(EV.PASS_SALT + String(code || '')); };
   if (!EV.settings.passcodeHash) {
     EV.settings.passcodeHash = EV.hashPass('89370');
+    EV.save();
+  }
+
+  /* Posts have to see each other's patients within seconds — a transfer called
+     over the radio arrives before the record does otherwise. Devices that saved
+     the old 15s default keep it in localStorage, so migrate them here; a stale
+     stored value would quietly pin a tablet slow for the whole event. */
+  if (!EV.settings.sync.intervalMs || EV.settings.sync.intervalMs >= 15000) {
+    EV.settings.sync.intervalMs = 4000;
     EV.save();
   }
 
@@ -716,8 +725,23 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
 
     EV.emit('change', { type: doc._t, id: doc.id, doc: doc });
     EV.emit('change:' + doc._t, doc);
+    nudgeSync();
     return Promise.all([persist(doc), persistOutbox(k, doc)]).then(function () { return doc; });
   };
+
+  /* The interval is the ceiling on how stale a reader can be, not how long a
+     writer waits: a local edit goes up almost immediately, so a patient booked
+     in at one post shows at the others in about a second. Debounced, so typing
+     a name is one request rather than one per keystroke. */
+  var nudgeTimer = null;
+  function nudgeSync() {
+    if (nudgeTimer) return;
+    if (!EV.settings.sync.enabled || !EV.settings.eventId) return;
+    nudgeTimer = setTimeout(function () {
+      nudgeTimer = null;
+      store.sync();
+    }, 350);
+  }
 
   /* Soft delete. A tombstone still syncs, otherwise a record deleted on one
      post reappears the next time another post pushes its copy. */
@@ -860,7 +884,10 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
       s.lastError = s.error;
       s.failures++;
       s.online = EV.online();
-      backoff = Math.min(backoff ? backoff * 2 : 1, 16);
+      /* Capped lower than it looks: at a 4s base this tops out around half a
+         minute, so a post that drops off the network rejoins quickly instead of
+         sitting out a four-minute backoff. */
+      backoff = Math.min(backoff ? backoff * 2 : 1, 8);
       EV.logError('store.sync', e);
     }).then(function () {
       s.busy = false;
@@ -1027,6 +1054,7 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
     { v: 'first-aid', l: 'First aid post', icon: '+' },
     { v: 'ice-bath', l: 'Cooling / ice bath', icon: '❄' },
     { v: 'roaming', l: 'Roaming team', icon: '⇢' },
+    { v: 'ambulance', l: 'Ambulance / transport', icon: '⇄' },
     { v: 'command', l: 'Command post', icon: '★' }
   ];
   M.BED_KINDS = [
@@ -1169,12 +1197,20 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
     return Math.max(0, ev.concludedAt + M.REOPEN_WINDOW - (now || EV.now()));
   };
 
+  /* The code a team types to join a post. Four digits: long enough that it is
+     not guessed in the three tries the join sheet allows, short enough to read
+     out over a radio in a noisy tent. Issued by the Command Center, which is
+     the only place posts can be created. */
+  M.newJoinCode = function () {
+    return String(1000 + Math.floor(Math.random() * 9000));
+  };
+
   M.newPost = function (o) {
     return Object.assign({
       _t: 'post', id: EV.uid('po'), eventId: EV.settings.eventId,
       code: '', name: '', kind: 'medical-tent', location: '',
       staff: [], active: true, sort: 0, seq: 0,
-      isCommandCenter: false
+      isCommandCenter: false, joinCode: M.newJoinCode()
     }, o || {});
   };
 
@@ -1190,7 +1226,8 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
     return Object.assign({
       _t: 'ambulance', id: EV.uid('am'), eventId: EV.settings.eventId,
       callsign: '', plate: '', crew: [], kind: 'bls',
-      status: 'available', patientId: null, destination: '', active: true
+      status: 'available', patientId: null, destination: '', active: true,
+      joinCode: M.newJoinCode()
     }, o || {});
   };
 
@@ -13960,6 +13997,13 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
     posts.forEach(function (post) {
       var beds = EV.model.beds(post.id);
       var head = EV.el('div', { class: 'row tight' }, [
+        /* Read out to the team on arrival — this screen is Command-Center-only,
+           so the codes are visible exactly where they are handed over. */
+        EV.el('span', {
+          class: 'tag mono',
+          title: 'The code this post\u2019s team types to join',
+          text: 'Join ' + (post.joinCode || 'not set')
+        }),
         UI.btn('Edit', 'sm ghost', function () { postSheet(post); }),
         UI.btn('Add bed', 'sm', function () { bedSheet(post); }, 'plus')
       ]);
@@ -14076,7 +14120,26 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
       options: EV.model.POST_KINDS.map(function (k) { return { v: k.v, l: k.l }; })
     });
     var loc = UI.field({ label: 'Location', value: p.location, cls: 'sm', placeholder: 'Gate 7 / Hall B / Stand 14' });
-    body.appendChild(EV.el('div', { class: 'fgrid' }, [code, EV.el('div', { class: 'w2' }, [name]), kind, loc]));
+
+    /* Posts created before join codes existed have none — give them one as soon
+       as the Command Center opens the post, so there is nothing left to forget. */
+    if (!p.joinCode) p.joinCode = EV.model.newJoinCode();
+    var join = UI.field({
+      label: 'Join code', value: p.joinCode, cls: 'sm', maxlength: 8,
+      hint: 'The team types this to join', placeholder: '0000'
+    });
+    body.appendChild(EV.el('div', { class: 'fgrid' }, [
+      code, EV.el('div', { class: 'w2' }, [name]), kind, loc, join
+    ]));
+    body.appendChild(EV.el('div', { class: 'row tight' }, [
+      UI.btn('Issue a new code', 'sm ghost', function () {
+        join.input.value = EV.model.newJoinCode();
+      }),
+      EV.el('span', {
+        class: 'tiny muted',
+        text: 'Changing it does not sign out devices already working at this post.'
+      })
+    ]));
 
     /* The Command Center is where unrestricted access lives, so moving it is
        itself passcode-gated — otherwise the lock means nothing. */
@@ -14163,6 +14226,7 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
         p.name = name.input.value.trim();
         p.kind = kind.input.value;
         p.location = loc.input.value.trim();
+        p.joinCode = String(join.input.value || '').trim() || EV.model.newJoinCode();
         p.staff = staff.filter(function (s) { return String(s.name).trim(); });
         p.isCommandCenter = wantCC;
         var extra = [];
@@ -16283,7 +16347,7 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
           class: 'small muted grow',
           text: 'No posts yet — an admin must add them before anyone can join.'
         }));
-        f.appendChild(UI.btn('Set up posts', '', function () { adminInto(ev); }, 'gear'));
+        f.appendChild(UI.btn('Set up posts', '', function () { adminInto(ev); }, 'lock'));
       } else {
         f.appendChild(UI.btn('Join this event', 'pri', function () { joinFlow(ev); }, 'check'));
       }
@@ -16431,6 +16495,66 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
   }
 
   /* ---- join --------------------------------------------------------------- */
+  /* Every device that joins a post must present that post's own join code. The
+     Command Center issues them, and Settings → Posts is the only place a post
+     can be created at all, so no team — an ambulance crew included — can file
+     records against a post unless the Command Center handed over its code.
+     Posts made before codes existed have none; those ask for the admin passcode
+     instead, so an old event is never a way in and never a lockout either. */
+  function askJoinCode(post) {
+    var want = String((post && post.joinCode) || '').trim();
+    if (!want) {
+      return UI.requireUnlock('This post has no join code yet. The admin passcode will do — ' +
+        'or ask the Command Center to issue one.');
+    }
+    return new Promise(function (resolve) {
+      var done = false;
+      var tries = 0;
+      var input = EV.el('input', {
+        type: 'password', inputmode: 'numeric', autocomplete: 'off', maxlength: 8,
+        placeholder: '••••',
+        style: {
+          fontFamily: 'var(--font-mono)', fontSize: '26px', letterSpacing: '.3em',
+          textAlign: 'center', padding: '12px', width: '100%',
+          border: '1px solid var(--line)', borderRadius: '8px', background: 'var(--ground)'
+        }
+      });
+      var err = EV.el('div', { class: 'err', style: { minHeight: '16px' } });
+      var sh = UI.sheet({
+        title: 'Join code — ' + ((post && (post.code || post.name)) || 'this post'),
+        body: EV.el('div', { class: 'stack' }, [
+          EV.el('p', {
+            class: 'muted', style: { margin: 0 },
+            text: 'The Command Center issues this code. Ask for it before you start recording here.'
+          }),
+          input, err
+        ]),
+        footer: [],
+        onClose: function () { if (!done) resolve(false); }
+      });
+      function submit() {
+        if (String(input.value).trim() === want) {
+          done = true;
+          sh.close();
+          resolve(true);
+          return;
+        }
+        tries++;
+        err.textContent = tries >= 3
+          ? 'Still no match — ask the Command Center to read the code out again.'
+          : 'That code does not match this post.';
+        input.value = '';
+        input.focus();
+      }
+      input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
+      sh.setFooter([
+        UI.btn('Cancel', '', function () { sh.close(); }),
+        UI.btn('Join', 'pri', submit, 'check')
+      ]);
+      setTimeout(function () { input.focus(); }, 40);
+    });
+  }
+
   function joinFlow(ev) {
     EV.settings.eventId = ev.id;
     EV.save();
@@ -16489,8 +16613,12 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
         UI.btn('Cancel', '', function () { sh.close(); }),
         UI.btn('Next — your team', 'pri', function () {
           if (!sel.input.value) { sel.setError('Choose the post'); return; }
-          chosen.postId = sel.input.value;
-          stepTeam();
+          var pid = sel.input.value;
+          askJoinCode(EV.store.get('post', pid)).then(function (ok) {
+            if (!ok) return;
+            chosen.postId = pid;
+            stepTeam();
+          });
         })
       ]);
     }
@@ -16606,30 +16734,43 @@ EV.LOGO_JPEG_W = 420; EV.LOGO_JPEG_H = 170;
   /* An admin setting an event up has not joined a post yet, so bind the device
      to the Command Center (creating one if the event has none) — otherwise the
      settings screens have no identity to work from. */
+  /* The Command Center is unrestricted access to every post on the event, and
+     this is the only function that hands it out. The passcode is asked for HERE
+     rather than at each call site, because it was a call site that leaked: the
+     event card's own "Set up posts" button walked straight in, so anyone who
+     merely opened the URL could take Command Center on someone else's event.
+     Gating the function means no future caller can reopen that hole. Nothing is
+     written before the check — not even settings.eventId — so a refused prompt
+     leaves the device exactly as it was. requireUnlock short-circuits inside its
+     15-minute window, so arriving here from admin login never asks twice. */
   function adminInto(ev) {
-    EV.settings.eventId = ev.id;
-    EV.save();
-    var cp = EV.store.all('post', function (p) {
-      return p.eventId === ev.id && p.isCommandCenter;
-    })[0];
-    var ready = cp ? Promise.resolve(cp) : (function () {
-      var post = EV.model.newPost({
-        eventId: ev.id, code: 'CMD', name: 'Command Center',
-        kind: 'command', isCommandCenter: true, sort: 0
-      });
-      return EV.store.put(post).then(function () {
-        var e2 = EV.clone(EV.store.get('event', ev.id));
-        e2.commandPostId = post.id;
-        return EV.store.put(e2).then(function () { return post; });
-      });
-    })();
+    return UI.requireUnlock('Signing in at the Command Center needs the admin passcode.')
+      .then(function (ok) {
+        if (!ok) return;
+        EV.settings.eventId = ev.id;
+        EV.save();
+        var cp = EV.store.all('post', function (p) {
+          return p.eventId === ev.id && p.isCommandCenter;
+        })[0];
+        var ready = cp ? Promise.resolve(cp) : (function () {
+          var post = EV.model.newPost({
+            eventId: ev.id, code: 'CMD', name: 'Command Center',
+            kind: 'command', isCommandCenter: true, sort: 0
+          });
+          return EV.store.put(post).then(function () {
+            var e2 = EV.clone(EV.store.get('event', ev.id));
+            e2.commandPostId = post.id;
+            return EV.store.put(e2).then(function () { return post; });
+          });
+        })();
 
-    ready.then(function (post) {
-      EV.model.bind(ev.id, post.id, EV.model.team().length ? EV.model.team() : [{ name: 'Admin', role: 'Logistic' }]);
-      EV.model.grantSuper();
-      EV.toast('Signed in at the Command Center', 'ok');
-      UI.go('settings', 'posts');
-    });
+        return ready.then(function (post) {
+          EV.model.bind(ev.id, post.id, EV.model.team().length ? EV.model.team() : [{ name: 'Admin', role: 'Logistic' }]);
+          EV.model.grantSuper();
+          EV.toast('Signed in at the Command Center', 'ok');
+          UI.go('settings', 'posts');
+        });
+      });
   }
 
   function reopen(ev) {
