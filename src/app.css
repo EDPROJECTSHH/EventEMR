@@ -557,6 +557,14 @@ hr { border: 0; border-top: 1px solid var(--line-soft); margin: 12px 0; }
 .vt td.ab { color: var(--bad); font-weight: 600; }
 .vt td.warn { color: var(--warn); font-weight: 600; }
 .vt tr:hover td { background: var(--surface-2); }
+/* The vitals table is intrinsically wider than a phone, which is why it has its
+   own horizontal scroll. That only works if the column it sits in is allowed to
+   be narrower than its content: a grid/flex item defaults to min-width:auto, so
+   .stack grew to the table's width, burst its track, and dragged the WHOLE
+   chart into a sideways scroll on every phone. Letting the item shrink puts the
+   scrolling back inside the table where it belongs. */
+.chart > * { min-width: 0; }
+.stack { min-width: 0; }
 .tblw { overflow-x: auto; }
 
 /* timeline — orders, CPPT and code events share one visual language */
