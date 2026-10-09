@@ -346,8 +346,12 @@
       var done = false;
       var tries = 0;
       var input = EV.el('input', {
-        type: 'password', inputmode: 'numeric', autocomplete: 'off', maxlength: 8,
-        placeholder: '••••',
+        /* NOT inputmode numeric. The Command Center sets these codes freely and
+           in the field they are often words, not digits ("p4d", "sky"), which a
+           numeric keypad cannot type at all on a phone. */
+        type: 'password', inputmode: 'text', autocomplete: 'off',
+        autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', maxlength: 16,
+        placeholder: 'Kode pos',
         style: {
           fontFamily: 'var(--font-mono)', fontSize: '26px', letterSpacing: '.3em',
           textAlign: 'center', padding: '12px', width: '100%',
